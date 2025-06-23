@@ -77,7 +77,6 @@ function generateUVs(positions, bbox) {
 }
 
 function createBufferGeometry(result) {
-    debugger
     const { position, indices, normal } = result;
     const geometry = new THREE.BufferGeometry();
 
