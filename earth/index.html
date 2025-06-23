@@ -1,0 +1,550 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+	<title>三维地球</title>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, user-scalable=no, minimum-scale=1.0, maximum-scale=1.0">
+	<link type="text/css" rel="stylesheet" href="./css/main.css">
+<body>
+	<div id="container" style="width:100%;height:100vh;position:relative; overflow: hidden;"></div>
+	<!-- vertext shader a.k.a. pixel shader -->
+	<script id="vertexShader" type="x-shader/x-vertex">
+		uniform vec3 viewVector;
+		uniform float c;
+		uniform float p;
+		varying vec2 vUv;
+		varying float intensity;
+
+		void main() {
+			vec3 v_normal = normalize(normalMatrix * normal);
+			vec3 v_view = normalize(normalMatrix * viewVector);
+			intensity = pow(c - dot(v_normal, v_view), p);
+			vUv = uv;
+			gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+		}
+	</script>
+	<script id="fragmentShader" type="x-shader/x-vertex">
+		uniform sampler2D diffuse;
+		uniform vec3 glowColor;
+		varying float intensity;
+		varying vec2 vUv;
+
+		void main() {
+			vec3 glow = glowColor * intensity;
+			gl_FragColor = vec4(glow, 1.0)+ texture2D(diffuse, vUv);
+		}
+	</script>
+	<!-- vertext shader a.k.a. pixel shader -->
+	<script id="vertexShader2" type="x-shader/x-vertex">
+		varying vec2 vUv;
+		attribute float percent;
+		uniform float u_time;
+		uniform float number;
+		uniform float speed;
+		uniform float length;
+		varying float opacity;
+		uniform float size;
+		void main()
+		{
+			vUv = uv;
+			vec4 mvPosition = modelViewMatrix * vec4( position, 1.0 );
+			float l = clamp(1.0-length,0.0,1.0);
+			gl_PointSize = clamp(fract(percent*number + l - u_time*number*speed)-l ,0.0,1.) * size * (1./length);
+			opacity = gl_PointSize/size;
+			gl_Position = projectionMatrix * mvPosition;
+		}
+	</script>
+	<!-- fragment shader a.k.a. pixel shader -->
+	<script id="fragmentShader2" type="x-shader/x-vertex">
+		#ifdef GL_ES
+		precision mediump float;
+		#endif
+		varying float opacity;
+		uniform vec3 color;
+		void main(){
+			if(opacity <=0.2){
+				discard;
+			}
+			gl_FragColor = vec4(color,1.0);
+		}
+	</script>
+	<script type="module">
+		import * as THREE from './js/three/three.module.js';
+		import { OrbitControls } from './js/jsm/controls/OrbitControls.js';
+		import Stats     from './js/jsm/libs/stats.module.js';
+		import { Line2 } from './js/jsm/lines/Line2.js';
+		import { LineMaterial } from './js/jsm/lines/LineMaterial.js';
+		import { LineGeometry } from './js/jsm/lines/LineGeometry.js';
+		import { TWEEN } from './js/jsm/libs/tween.module.min.js';
+		import { GUI }   from './js/jsm/libs/dat.gui.module.js';
+		let renderer, camera, scene, gui, light, stats, controls, geometry, material, line, matLine, mesh, stars, uniforms;
+		const Dom = document.querySelector('#container');
+		const radius = 5;
+		const width = Dom.clientWidth, height = Dom.clientHeight;
+		const group = new THREE.Group();
+		const groupDots  = new THREE.Group();
+		const groupLines = new THREE.Group();
+		const groupHalo  = new THREE.Group(); //卫星环+小卫星
+		const aGroup = new THREE.Group();
+		var WaveMeshArr = [];//所有波动光圈集合
+		var planGeometry = new THREE.PlaneBufferGeometry(1, 1); //默认在XOY平面上
+		var globeTextureLoader = new THREE.TextureLoader();
+		var map = new THREE.Object3D();
+		var camaPositions = [
+			{ x: 5, y: - 20, z: 200 }, //远处
+			{ x: 0.5, y: - 2, z: 20 }//近处
+		];
+		var API = {
+			c: 1.7,
+			p: 2.3,
+			color: 0x10105
+		};
+		var uniforms2 = {
+			u_time: { value: 0.0 }
+		};
+
+		/**
+		 * @desc 3d球面取点
+		 * @param <number> radius ...
+		 * @param <number> a ...
+		 * @param <number> b ...
+		 * @return <object> x,y,z
+		 */
+		function getPos(radius, a, b) {
+			var x = radius * Math.sin(a) * Math.cos(b);
+			var y = radius * Math.sin(a) * Math.sin(b);
+			var z = radius * Math.cos(a);
+			return { x, y, z };
+		}
+
+		//threejs自带的经纬度转换
+		function lglt2xyz(lng, lat) {
+			const theta = (90 + lng) * (Math.PI / 180);
+			const phi = (90 - lat) * (Math.PI / 180);
+			return (new THREE.Vector3()).setFromSpherical(new THREE.Spherical(radius, phi, theta));
+		}
+
+		/**
+		 * 经纬度坐标转球面坐标
+		 * @param {地球半径} R
+		 * @param {经度(角度值)} longitude
+		 * @param {维度(角度值)} latitude
+		 */
+		function lon2xyz(R, longitude, latitude) {
+			var lon = longitude * Math.PI / 180;//转弧度值
+			var lat = latitude * Math.PI / 180;//转弧度值
+			lon = - lon;// three.js坐标系z坐标轴对应经度-90度，而不是90度
+			// 经纬度坐标转球面坐标计算公式
+			var x = R * Math.cos(lat) * Math.cos(lon);
+			var y = R * Math.sin(lat);
+			var z = R * Math.cos(lat) * Math.sin(lon);
+			// 返回球面坐标
+			return {
+				x: x,
+				y: y,
+				z: z,
+			};
+		}
+
+
+		// 计算v1,v2 的中点
+		function getVCenter(v1, v2) {
+			const v = v1.add(v2);
+			return v.divideScalar(2);
+		}
+
+		// 计算V1，V2向量固定长度的点
+		function getLenVcetor(v1, v2, len) {
+			const v1v2Len = v1.distanceTo(v2);
+			return v1.lerp(v2, len / v1v2Len);
+		}
+
+		/**
+		 * @description 初始化渲染场景
+		 */
+		function initRenderer() {
+			renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+			renderer.setPixelRatio(window.devicePixelRatio);
+			renderer.setSize(width, height);
+			const containerDom = document.querySelector('#container');
+			containerDom.appendChild(renderer.domElement);
+		}
+
+		/**
+		 * @description 初始化相机
+		 */
+		function initCamera() {
+			camera = new THREE.PerspectiveCamera(45, width / height, 1, 10000);
+			camera.position.set(5, - 20, 200);
+			camera.lookAt(0, 3, 0);
+			window.camera = camera;
+		}
+
+		/**
+		 * @description 初始化场景
+		 */
+		function initScene() {
+			scene = new THREE.Scene();
+			scene.background = new THREE.Color(0x020924);
+			scene.fog = new THREE.Fog(0x020924, 200, 1000);
+			window.scene = scene;
+		}
+		/**
+		 * 初始化用户交互
+		 **/
+		function initControls() {
+			controls = new OrbitControls(camera, renderer.domElement);
+			// 如果使用animate方法时，将此函数删除
+			// controls.addEventListener( 'change', render );
+			// 使动画循环使用时阻尼或自转 意思是否有惯性
+			controls.enableDamping = true;
+			//动态阻尼系数 就是鼠标拖拽旋转灵敏度
+			//controls.dampingFactor = 0.25;
+			//是否可以缩放
+			controls.enableZoom = true;
+			//是否自动旋转
+			controls.autoRotate = false;
+			controls.autoRotateSpeed = 2;
+			//设置相机距离原点的最远距离
+			// controls.maxDistance = 1000;
+			//是否开启右键拖拽
+			controls.enablePan = false;
+            /**
+			 * X轴上的平移距离
+			*/
+			// var offset = new THREE.Vector3(6, 0, 0); 
+			// camera.position.add(offset);
+			// controls.target.add(offset);
+			renderer.render(scene, camera);
+		}
+
+		function initTween() {
+			var tweena = cameraCon(3000);
+			tweena.start();
+		}
+
+		function updateUvTransform() {
+			uniforms.c.value = API.c;
+			uniforms.p.value = API.p;
+			uniforms.glowColor.value = new THREE.Color(API.color);
+			renders();
+		}
+
+		function cameraCon(time) {
+			var tween1 = new TWEEN.Tween(camaPositions[0]).to(camaPositions[1], time).easing(TWEEN.Easing.Quadratic.InOut);
+			var update = () => {
+				camera.position.set(camaPositions[0].x, camaPositions[0].y, camaPositions[0].z);
+			};
+			tween1.onUpdate(update);
+			return tween1;
+		}
+
+		// 经纬度转地球坐标
+		function createPosition(lnglat) {
+			const spherical = new THREE.Spherical();
+			spherical.radius = radius;
+			const lng = lnglat[0];
+			const lat = lnglat[1];
+			const theta = (lng + 90) * (Math.PI / 180);
+			const phi = (90 - lat) * (Math.PI / 180);
+			spherical.phi = phi; //方位角
+			spherical.theta = theta; //倾斜角
+			const position = new THREE.Vector3();
+			position.setFromSpherical(spherical);
+			return position;
+		}
+
+		/**
+		 * @description 初始化光
+		 */
+		function initLight() {
+			const ambientLight = new THREE.AmbientLight(0xcccccc, 1.1);
+			scene.add(ambientLight);
+			var directionalLight = new THREE.DirectionalLight(0xffffff, 0.2);
+			directionalLight.position.set(1, 0.1, 0).normalize();
+			var directionalLight2 = new THREE.DirectionalLight(0xff2ffff, 0.2);
+			directionalLight2.position.set(1, 0.1, 0.1).normalize();
+			scene.add(directionalLight);
+			scene.add(directionalLight2);
+			var hemiLight = new THREE.HemisphereLight(0xffffff, 0x444444, 0.2);
+			hemiLight.position.set(0, 1, 0);
+			scene.add(hemiLight);
+			var directionalLight = new THREE.DirectionalLight(0xffffff);
+			directionalLight.position.set(1, 500, - 20);
+			directionalLight.castShadow = true;
+			directionalLight.shadow.camera.top = 18;
+			directionalLight.shadow.camera.bottom = - 10;
+			directionalLight.shadow.camera.left = - 52;
+			directionalLight.shadow.camera.right = 12;
+			scene.add(directionalLight);
+		}
+
+		/**
+		 * 初始化背景星空
+		 */
+		function initPoints() {
+			var texture = new THREE.TextureLoader().load('./imgs/diqiu2/gradient.png');
+			const positions = [];
+			const colors = [];
+			const geometry = new THREE.BufferGeometry();
+			for (var i = 0; i < 10000; i++) {
+				var vertex = new THREE.Vector3();
+				vertex.x = Math.random() * 2 - 1;
+				vertex.y = Math.random() * 2 - 1;
+				vertex.z = Math.random() * 2 - 1;
+				positions.push(vertex.x, vertex.y, vertex.z);
+				var color = new THREE.Color();
+				color.setHSL(Math.random() * 0.2 + 0.5, 0.55, Math.random() * 0.25 + 0.55);
+				colors.push(color.r, color.g, color.b);
+			}
+			geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+			geometry.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+			var starsMaterial = new THREE.ParticleBasicMaterial({
+				map: texture,
+				size: 1,
+				transparent: true,
+				opacity: 1,
+				vertexColors: true, //true：且该几何体的colors属性有值，则该粒子会舍弃第一个属性--color，而应用该几何体的colors属性的颜色
+				blending: THREE.AdditiveBlending,
+				sizeAttenuation: true
+			});
+			stars = new THREE.ParticleSystem(geometry, starsMaterial);
+			stars.scale.set(300, 300, 300);
+			scene.add(stars);
+		}
+
+		/**
+		 * 包含2个，一个地球，一个辉光球体
+		 */
+		function initEarth() {
+			// 地球
+			globeTextureLoader.load('./imgs/diqiu2/earth2.jpg', function (texture) {
+				var globeGgeometry = new THREE.SphereGeometry(radius, 100, 100);
+				var globeMaterial = new THREE.MeshStandardMaterial({ map: texture, side: THREE.DoubleSide });
+				var globeMesh = new THREE.Mesh(globeGgeometry, globeMaterial);
+				group.rotation.set(0.5, 2.9, 0.1);
+				group.add(globeMesh);
+				scene.add(group);
+			});
+		}
+
+		/**
+		 * 包含2个，一个地球，一个辉光球体
+		 */
+		function initEarth2() {
+			uniforms = {
+				u_time: { value: 0.0 },
+				c: { type: 'f', value: 2.3 }, //2.1 								// 系数
+				p: { type: 'f', value: 1.7 }, //1.7 								// 强度
+				diffuse: { // 用于实现扫描效果的贴图
+					type: 't',
+					value: new THREE.TextureLoader().load('./imgs/diqiu2/earth2.jpg')
+				},
+				glowColor: { type: 'c', value: new THREE.Color(0x10105) }, /// 光罩的颜色
+				viewVector: { // 相机位置
+					type: 'v3', value: new THREE.Vector3(0, 0, 1)
+				},
+				blending: THREE.AdditiveBlending
+			};
+			uniforms['diffuse'].value.wrapS = uniforms['diffuse'].value.wrapT = THREE.RepeatWrapping;
+			var material = new THREE.ShaderMaterial({
+				uniforms: uniforms,
+				vertexShader: document.getElementById('vertexShader').textContent,
+				fragmentShader: document.getElementById('fragmentShader').textContent,
+				side: THREE.DoubleSide,
+				// depthWrite: false,
+				// transparent: true,
+			});
+			var globeGgeometry = new THREE.SphereGeometry(radius, 100, 100);
+			var globeMesh = new THREE.Mesh(globeGgeometry, material);
+			group.rotation.set(0.5, 2.9, 0.1);
+			group.add(globeMesh);
+			scene.add(group);
+		}
+
+		/**
+		 * 创建地球光晕特效
+		 */
+		function initEarthSprite() {
+			var texture = globeTextureLoader.load('./imgs/diqiu2/earth_aperture.png');
+			var spriteMaterial = new THREE.SpriteMaterial({
+				map: texture,
+				transparent: true,
+				opacity: 0.5,
+				depthWrite: false
+			});
+			var sprite = new THREE.Sprite(spriteMaterial);
+			sprite.scale.set(radius * 3, radius * 3, 1);
+			group.add(sprite);
+		}
+
+		/**
+		 * 中国描边高亮
+		 */
+		function initGeoJson() {
+			const loader = new THREE.FileLoader();
+			loader.load('./models/json/geoJson/china.json', function (data) {
+				const jsonData = JSON.parse(data);
+				initMap(jsonData);
+			});
+			loader.load('./models/json/geoJson/china-outline.json', function (data) {
+				const jsonData = JSON.parse(data);
+				outLineMap(jsonData);
+			});
+		}
+
+		function outLineMap(json) {
+			json.features.forEach(elem => {
+				// 新建一个省份容器：用来存放省份对应的模型和轮廓线
+				const province = new THREE.Object3D();
+				const coordinates = elem.geometry.coordinates;
+				coordinates.forEach(multiPolygon => {
+					multiPolygon.forEach(polygon => {
+						// 这里的坐标要做2次使用：1次用来构建模型，1次用来构建轮廓线
+						if (polygon.length > 200) {
+							var v3ps = [];
+							for (let i = 0; i < polygon.length; i++) {
+								var pos = lglt2xyz(polygon[i][0], polygon[i][1]);
+								v3ps.push(pos);
+							}
+							var curve = new THREE.CatmullRomCurve3(v3ps, false/*是否闭合*/);
+							var color = new THREE.Vector3(0.5999758518718452, 0.7798940272761521, 0.6181903838257632);
+							var flyLine = initFlyLine(curve, {
+								speed: 0.4,
+								// color: randomVec3Color(),
+								color: color,
+								number: 3, //同时跑动的流光数量
+								length: 0.2, //流光线条长度
+								size: 3 //粗细
+							}, 5000);
+							province.add(flyLine);
+						}
+					});
+				});
+				map.add(province);
+			});
+			group.add(map);
+		}
+
+		function initMap(chinaJson) {
+			// 遍历省份构建模型
+			chinaJson.features.forEach(elem => {
+				// 新建一个省份容器：用来存放省份对应的模型和轮廓线
+				const province = new THREE.Object3D();
+				const coordinates = elem.geometry.coordinates;
+				coordinates.forEach(multiPolygon => {
+					multiPolygon.forEach(polygon => {
+						const lineMaterial = new THREE.LineBasicMaterial({ color: 0XF19553 }); //0x3BFA9E
+						const positions = [];
+						const linGeometry = new THREE.BufferGeometry();
+						for (let i = 0; i < polygon.length; i++) {
+							var pos = lglt2xyz(polygon[i][0], polygon[i][1]);
+							positions.push(pos.x, pos.y, pos.z);
+						}
+						linGeometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+						const line = new THREE.Line(linGeometry, lineMaterial);
+						province.add(line);
+					});
+				});
+				map.add(province);
+
+			});
+			group.add(map);
+		}
+
+		/**
+		 * @param curve {THREE.Curve} 路径,
+		 * @param matSetting {Object} 材质配置项
+		 * @param pointsNumber {Number} 点的个数 越多越细致
+		 * */
+		function initFlyLine(curve, matSetting, pointsNumber) {
+			var points = curve.getPoints(pointsNumber);
+			var geometry = new THREE.BufferGeometry().setFromPoints(points);
+			const length = points.length;
+			var percents = new Float32Array(length);
+			for (let i = 0; i < points.length; i += 1) {
+				percents[i] = (i / length);
+			}
+			geometry.addAttribute('percent', new THREE.BufferAttribute(percents, 1));
+			const lineMaterial = initLineMaterial(matSetting);
+			var flyLine = new THREE.Points(geometry, lineMaterial);
+			return flyLine;
+		}
+
+		function initLineMaterial(setting) {
+			const number = setting ? (Number(setting.number) || 1.0) : 1.0;
+			const speed = setting ? (Number(setting.speed) || 1.0) : 1.0;
+			const length = setting ? (Number(setting.length) || 0.5) : 0.5;
+			const size = setting ? (Number(setting.size) || 3.0) : 3.0;
+			const color = setting ? setting.color || new THREE.Vector3(0, 1, 1) : new THREE.Vector3(0, 1, 1);
+			const singleUniforms = {
+				u_time: uniforms2.u_time,
+				number: { type: 'f', value: number },
+				speed: { type: 'f', value: speed },
+				length: { type: 'f', value: length },
+				size: { type: 'f', value: size },
+				color: { type: 'v3', value: color }
+			};
+			const lineMaterial = new THREE.ShaderMaterial({
+				uniforms: singleUniforms,
+				vertexShader: document.getElementById('vertexShader2').textContent,
+				fragmentShader: document.getElementById('fragmentShader2').textContent,
+				transparent: true,
+				//blending:THREE.AdditiveBlending,
+			});
+			return lineMaterial;
+		}
+
+		/**
+		 * 窗口变动
+		 **/
+		function onWindowResize() {
+			camera.aspect = innerWidth / innerHeight;
+			camera.updateProjectionMatrix();
+			renders();
+			renderer.setSize(innerWidth, innerHeight);
+		}
+
+		/**
+		 * @description 渲染
+		 */
+		function renders() {
+			renderer.clear();
+			renderer.render(scene, camera);
+		}
+
+		/**
+		 * 更新
+		 **/
+		function animate() {
+			window.requestAnimationFrame(() => {
+				if (controls) controls.update();
+				if (TWEEN) TWEEN.update();
+				renders();
+				animate();
+			});
+		}
+
+		window.onload = () => {
+			initRenderer();
+			initCamera();
+			initScene();
+			initLight();
+			//初始化地球
+			initEarth();
+			//地球光晕
+			// initEarthSprite();
+			//初始化动态星空背景
+			initPoints();
+			//外圈中国描边高亮
+			initGeoJson();
+			initControls();
+			initTween();
+			animate();
+			window.addEventListener('resize', onWindowResize, false);
+		};
+
+	</script>
+</body>
+
+</html>

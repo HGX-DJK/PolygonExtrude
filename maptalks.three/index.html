@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+  <title>extrudepolyogn china</title>
+  <link type="text/css" rel="stylesheet" href="https://unpkg.com/maptalks/dist/maptalks.css">
+  <script type="text/javascript" src="https://unpkg.com/maptalks/dist/maptalks.js"></script>
+  <script type="text/javascript" src="https://unpkg.com/@maptalks/gl/dist/maptalksgl.js"></script>
+  <script type="text/javascript" src="https://unpkg.com/three@0.138.0/build/three.min.js"></script>
+  <script type="text/javascript" src="https://unpkg.com/maptalks.three@latest/dist/maptalks.three.js"></script>
+  <script type="text/javascript" src="https://unpkg.com/poly-extrude/dist/poly-extrude.js"></script>
+  <!-- <script type="text/javascript" src="./bbox.js"></script>
+  <script type="text/javascript" src="./util.js"></script> -->
+  <style>
+    html,
+    body {
+      margin: 0px;
+      height: 100%;
+      width: 100%;
+    }
+
+    #map {
+      width: 100%;
+      height: 100%;
+      background-color: #000;
+    }
+  </style>
+</head>
+
+<body>
+  <div id="map"></div>
+  <script>
+    var map = new maptalks.Map("map", {
+      center: [112.52620398977056, 31.33093747831741],
+      zoom:7.5,
+      pitch:50,
+      centerCross: true,
+      doubleClickZoom: false,
+      minZoom: 6,
+      /**放大缩小zoom控件 */
+      zoomControl: {
+        position: { bottom: 40, right: 30 }
+      },
+      //设置是否重复显示世界地图
+      repeatWorld: false,
+      baseLayer: new maptalks.TileLayer('tile', {
+        urlTemplate: "https://services.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+        subdomains: ["a", "b", "c", "d"],
+        attribution: '&copy; <a href="https://www.esri.com/en-us/home">esri</a>',
+        opacity: 0.4
+      })
+    });
+    /**复制数据*/
+    function cloeData(data) {
+      if (window.ststructuredClone) {
+        return window.ststructuredClone(data);
+      };
+      return JSON.parse(JSON.stringify(data));
+    }
+    var threeLayer = new maptalks.ThreeLayer('t', {
+      forceRenderOnMoving: true,
+      forceRenderOnRotating: true,
+      animation: true
+    });
+    var meshs = [];
+    threeLayer.prepareToDraw = function (gl, scene, camera) {
+      new THREE.TextureLoader().load('./data/top.png', (texture) => {
+        //侧边纹理
+        var polygonSideMaterial = new THREE.MeshBasicMaterial({ color: '#065690' });
+        // texture.wrapS = texture.wrapT = THREE.ClampToEdgeWrapping; // 避免重复
+        texture.needsUpdate = true;
+        texture.wrapS = texture.wrapT = THREE.RepeatWrapping;
+        texture.repeat.set(1, 1);
+        //顶部的材质贴图
+        var polygonMaterial = new THREE.MeshBasicMaterial({ color: 'rgb(255,255,255)', map: texture });
+        /*******************设置光照*********************/
+        var light = new THREE.DirectionalLight(0xffffff);
+        light.position.set(0, -10, 10).normalize();
+        scene.add(light);
+        /*******************添加数据*********************/
+        fetch('./data/china.json').then(res => res.json()).then(geojson => {
+          const topData = [];
+          geojson.features.forEach(f => {
+            let height = f.properties.height || 50000;
+            f.properties.height = height;
+            const mesh = threeLayer.toExtrudePolygons(f, {
+              height,
+              topColor: '#fff',
+              asynchronous: true,
+              interactive: false
+            }, polygonSideMaterial);
+            meshs.push(mesh);
+            const topf = cloeData(f);
+            topf.properties.height = 0.1;
+            topf.properties.bottomHeight = height;
+            topData.push(topf);
+          });
+          threeLayer.addMesh(meshs);
+          let topPolygonMesh = threeLayer.toExtrudePolygons(topData, { asynchronous: true, interactive: false }, polygonMaterial);
+          // 根据集合数据的BBOX重新计算UV
+          threeLayer.on('layerload', () => {
+              const group = topPolygonMesh.object3d;
+              if (!group) return;
+              group.traverse(child => {
+                if (child.isMesh && child.geometry && child.geometry.attributes.position) {
+                  const posAttr = child.geometry.attributes.position;
+                  const positions = posAttr.array;
+                  // 1. 计算 XY 投影平面的包围盒
+                  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+                  for (let i = 0; i < positions.length; i += 3) {
+                    const x = positions[i];
+                    const y = positions[i + 1];
+                    if (x < minX) minX = x;
+                    if (y < minY) minY = y;
+                    if (x > maxX) maxX = x;
+                    if (y > maxY) maxY = y;
+                  };
+                  const width = maxX - minX;
+                  const height = maxY - minY;
+                  // 2. 根据 bbox 生成新的 UV（按 XY 贴图）
+                  const uv = [];
+                  for (let i = 0; i < positions.length; i += 3) {
+                    const x = positions[i];
+                    const y = positions[i + 1];
+                    const u = (x - minX) / width;
+                    const v = (y - minY) / height;
+                    uv.push(u, v);
+                  };
+                  // 3. 设置新的 UV
+                  child.geometry.setAttribute('uv', new THREE.Float32BufferAttribute(uv, 2));
+                  child.geometry.attributes.uv.needsUpdate = true;
+                }
+              });
+          });
+          threeLayer.addMesh(topPolygonMesh);
+        });
+      })
+      threeLayer.config('animation', true);
+    };
+    const sceneConfig = {
+      postProcess: {
+        enable: true,
+        antialias: { enable: true }
+      }
+    };
+    const groupLayer = new maptalks.GroupGLLayer('group', [threeLayer], { sceneConfig });
+    groupLayer.addTo(map);
+
+    map.on("click", (e) => {
+      console.log(e.coordinate);
+
+    })
+
+  </script>
+</body>
+
+</html>
