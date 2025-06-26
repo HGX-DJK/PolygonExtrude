@@ -47,7 +47,6 @@
                     const time = 'time';
                     console.time(time);
                     const result = polyextrude.extrudePolygons(type === 'Polygon' ? [coordinates] : coordinates, { depth: 20});
-
                     console.timeEnd(time);
                     console.log(result);
                     const geometry = createBufferGeometry(result);
